@@ -14,8 +14,23 @@ from RF24 import RF24, RF24_PA_LOW, RF24_PA_MAX, RF24_250KBPS
 import paho.mqtt.client
 from configparser import ConfigParser
 
+parser = argparse.ArgumentParser(description='monitor homiles')
+parser.add_argument('-c', dest='configName', action='store', default='ahoy.conf',help='config file with settings')
+parser.add_argument('-m', dest='mqttMode', action='store', default='1',help='mqtt mode, default 1')
+parser.add_argument('-d', dest='debugMode', action='store', default='0',help='debug output, default 0')
+args = vars(parser.parse_args())
+
+mqttMode=int(args['mqttMode'])>0
+print("mqttMode",mqttMode)
+
+debugMode=int(args['debugMode'])>0
+print("debugMode",debugMode)
+
+configName=args['configName']
+print("using config from",configName)
+
 cfg = ConfigParser()
-cfg.read('ahoy.conf')
+cfg.read(configName)
 mqtt_host = cfg.get('mqtt', 'host', fallback='192.168.1.1')
 mqtt_port = cfg.getint('mqtt', 'port', fallback=1883)
 mqtt_user = cfg.get('mqtt', 'user', fallback='')
@@ -33,12 +48,34 @@ dtu_ser = cfg.get('dtu', 'serial', fallback='99978563412')  # identical to fc22'
 # inverter serial numbers
 inv_ser = cfg.get('inverter', 'serial', fallback='444473104619')  # my inverter
 
-# all inverters
+l_inv_ser=inv_ser.strip().split(",") 
+
+#all inverters
 #...
 
 f_crc_m = crcmod.predefined.mkPredefinedCrcFun('modbus')
 f_crc8 = crcmod.mkCrcFun(0x101, initCrc=0, xorOut=0)
 
+def ser_to_type(s):
+    radioKey=s[4:]
+    if s.startswith("1161"):                # Thomas B (tnombody), peter l, lukasp
+        return ("HM-1200",radioKey,4)       # HM-1500
+    elif s.startswith("1121"):              #
+        return ("HM-300",radioKey,2)        # HM-350, HM-400   marcel, franz, (mpolak 350+700), avr-herbi
+    elif s.startswith("1141"):              #petersilie, Martin P. (mpolak77), carsten B, golf2010, jan-jonas s, lpb
+        return ("HM-600",radioKey,2)        # HM-700, HM-800
+    elif s.startswith("1060"):              #
+        return ("MI-1000",radioKey,2)       #
+    elif s.startswith("1061"):              #
+        return ("MI-1200",radioKey,4)       # MI-1500        
+    elif s.startswith("1020"):              #
+        return ("MI-250",radioKey,2)        #
+    elif s.startswith("1021"):              #
+        return ("MI-300",radioKey,2)        #        
+    elif s.startswith("1040"):              #
+        return ("MI-500",radioKey,2)        #    
+    else:
+        return ("",radioKey,1)  
 
 def ser_to_hm_addr(s):
     """
@@ -65,7 +102,7 @@ def ser_to_esb_addr(s):
     return air_order[::-1]
 
 
-def compose_0x80_msg(dst_ser_no=72220200, src_ser_no=72220200, ts=None):
+def compose_0x80_msg(dst_ser_no=72220200, src_ser_no=72220200, ts=None, subtype=b'\x0b'):
     """
     Create a valid 0x80 request with the given parameters, and containing the 
     current system time.
@@ -82,7 +119,7 @@ def compose_0x80_msg(dst_ser_no=72220200, src_ser_no=72220200, ts=None):
     p = p + b'\x80'
 
     # encapsulated payload
-    pp = b'\x0b\x00'
+    pp = subtype + b'\x00'
     pp = pp + struct.pack('>L', ts)  # big-endian: msb at low address
     #pp = pp + b'\x00' * 8    # of22 adds a \x05 at position 19
 
@@ -107,21 +144,27 @@ def print_addr(a):
 # time of last transmission - to calculcate response time
 t_last_tx = 0
 
-def on_receive(p, ch_rx=None, ch_tx=None):
+def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(), latency=None):
     """
-    Callback: get's invoked whenever a packet has been received.
+    Callback: get's invoked whenever a Noridc ESB packet has been received.
     :param p: Payload of the received packet.
     """
 
     d = {}
-
+    dd = {}
+    
     t_now_ns = time.monotonic_ns()
     ts = datetime.utcnow()
     ts_unixtime = ts.timestamp()
+    size=len(p)
     d['ts_unixtime'] = ts_unixtime
     d['isodate'] = ts.isoformat()
     d['rawdata'] = " ".join([f"{b:02x}" for b in p])
-    print(ts.isoformat(), end='Z ')
+    d['trans_id'] = ctr
+
+    dt = time_rx.strftime("%Y-%m-%d %H:%M:%S.%f")
+    print(f"{dt} Received {size} bytes on channel {ch_rx} after tx {latency}ns: " +
+        " ".join([f"{b:02x}" for b in p]))
 
     # check crc8
     crc8 = f_crc8(p[:-1])
@@ -138,92 +181,367 @@ def on_receive(p, ch_rx=None, ch_tx=None):
  
     if mid == 0x95:
         src, dst, cmd = struct.unpack('>LLB', p[1:10])
+        inv_id=f'{src:08x}'
+        if inv_id in m_last_tx:
+            d['response_time_ns'] = t_now_ns-m_last_tx[inv_id]
         d['src'] = f'{src:08x}'
         d['dst'] = f'{dst:08x}'
         d['cmd'] = cmd
-        print(f'MSG src={d["src"]}, dst={d["dst"]}, cmd={d["cmd"]}:')
+        if debugMode:
+            print(f'MSG src={d["src"]}, dst={d["dst"]}, cmd={d["cmd"]}:')
 
-        if cmd==1:
-            d['name'] = 'dcdata'
-            unknown1, u1, i1, p1, u2, i2, p2, unknown2 = struct.unpack(
-                '>HHHHHHHH', p[10:26])
-            d['u1_V'] = u1/10
-            d['i1_A'] = i1/100
-            d['p1_W'] = p1/10
-            d['u2_V'] = u2/10
-            d['i2_A'] = i2/100
-            d['p2_W'] = p2/10
-            d['p_W'] = d['p1_W']+d['p2_W']
-            d['unknown1'] = unknown1
-            d['unknown2'] = unknown2
+        if inv_id not in mType:
+            return
+        invType=mType[inv_id]
+        d['fullsrc']=mFullSer[inv_id]
+        
+        if invType=="HM-1200": # based on lumapu  https://www.mikrocontroller.net/topic/525778?page=single#7038756
+            d["infos"]=[dd]
+            
+            if cmd==1:
+                dd['name'] = 'emeter-dc'  # guess voltages are dc like with hm-600 and total power is long 
+                uk1, u1, i1, i2, p1, p2, ptotal1, uk8 = struct.unpack('>HHHHHHLH', p[10:28])
+                    
+                dd['1/voltage'] = u1/10
+                dd['1/current'] = i1/100
+                dd['2/current'] = i2/10
+                dd['1/power'] = p1/10
+                dd['2/power'] = p2/10
+                dd['1/totalpower'] = ptotal1
+                
+                dd['_uk1'] = uk1
+                dd['_uk8'] = uk8
 
-        elif cmd==2:
-            d['name'] = 'acdata'
-            uk1, uk2, uk3, uk4, uk5, u, f, p = struct.unpack(
-                '>HHHHHHHH', p[10:26])
-            d['u_V'] = u/10
-            d['f_Hz'] = f/100
-            d['p_W'] = p/10
-            d['wtot1_Wh'] = uk1
-            d['wtot2_Wh'] = uk3
-            d['wday1_Wh'] = uk4
-            d['wday2_Wh'] = uk5
-            d['uk2'] = uk2
+            elif cmd==2:
+                dd['name'] = 'emeter-dc'  # guess voltages are dc like with hm-600 
+                ptotal2, pday1, pday2, u2, i3, i4, p3, uk8 = struct.unpack('>LHHHHHHH', p[10:28])
+                    
+                dd['2/voltage'] = u2/10
+                dd['3/current'] = i3/100
+                dd['4/current'] = i4/10
+                _hm1200_i4=i4/10
+                if i4==0:
+                    dd['4/voltage'] = 0
+                    dd['4/power'] = 0
+                elif _hm1200_p4!=0:
+                    dd['4/voltage'] = _hm1200_p4/_hm1200_i4
+                    
+                dd['3/power'] = p3/10   
+                dd['3/voltage'] = p3/i3  # hack where is it
+ 
+                dd['2/totalpower'] = ptotal2
+                dd['1/todayspower'] = pday1
+                dd['2/todayspower'] = pday2
+                                
+                dd['_uk8'] = uk8
+        
+            elif cmd==3:
+                dd['name'] = 'emeter-dc'  # guess voltages are dc like with hm-600 
+                p4, ptotal3, ptotal4, pday3, pday4, u, uk7 = struct.unpack('>HLLHHHH', p[10:28])
+                
+                dd['4/power'] = p4/10    # where is voltage channel 2+3, 3 cannot be calculated with single message
+                _hm1200_p4=p4/10
+                if p4==0:
+                    dd['4/voltage'] = 0
+                    dd['4/current'] = 0
+                elif _hm1200_i4!=0:
+                    dd['4/voltage'] = _hm1200_p4/_hm1200_i4
+                                
+                dd['3/totalpower'] = ptotal3
+                dd['4/totalpower'] = ptotal4
+                dd['4/todayspower'] = pday3
+                dd['4/todayspower'] = pday4
+                
+                dd={}
+                d["infos"].append(dd)
+                dd['name'] = 'emeter' 
+                dd['0/voltageAC'] = u/10                
 
-        elif cmd==129:
-            d['name'] = 'error'
+                dd['_uk7'] = uk7
+              
+            elif cmd==132: #0x84
+                freq, p, uk3, i, pctload, t = struct.unpack('>HHHHHH', p[10:22])
+                dd['name'] = 'emeter'    
+                dd['0/frequency'] = freq/100
+                dd['0/powerAC'] = p/10
+                dd['0/currentAC'] = i/100
+                dd['0/voltageAC'] = (p/10)/(i/100)
+                dd['0/pctload'] = pctload/10
+                dd['0/temperature'] = t/10
+                
+                dd['_uk3'] = uk3
+                
+        
+        if invType=="HM-600":       # original petersilie ahoy.py with renaming
+            d["infos"]=[dd]
+            if cmd==1:
+                dd['name'] = 'emeter-dc'
+                uk1, u1, i1, p1, u2, i2, p2, uk8 = struct.unpack(
+                    '>HHHHHHHH', p[10:26])
+                dd['1/voltage'] = u1/10
+                dd['1/current'] = i1/100
+                dd['1/power'] = p1/10
+                dd['2/voltage'] = u2/10
+                dd['2/current'] = i2/100
+                dd['2/power'] = p2/10
+                p=p1+p2
+                
+                dd={}
+                d["infos"].append(dd)
+                dd['name'] = 'emeter'    
+                dd['0/powerAC'] = p
+                dd['_uk1'] = uk1
+                dd['_uk8'] = uk8
 
-        elif cmd==131:  # 0x83
-            d['name'] = 'statedata'
-            uk1, l, uk3, t, uk5, uk6 = struct.unpack('>HHHHHH', p[10:22])
-            d['l_Pct'] = l
-            d['t_C'] = t/10
-            d['uk1'] = uk1
-            d['uk3'] = uk3
-            d['uk5'] = uk5
-            d['uk6'] = uk6
+            elif cmd==2:
+                dd['name'] = 'emeter'
+                ptotal1, ptotal2, pday1, pday2, u, f, p = struct.unpack(
+                    '>HLHHHHH', p[10:26])
+                dd['0/voltageAC'] = u/10
+                dd['0/frequency'] = f/100
+                dd['0/powerAC'] = p/10    
+                dd['0/currentAC'] = i/100
+                
+                dd={}
+                d["infos"].append(dd)
+                dd['name'] = 'emeter-dc'  
+                dd['1/totalpower'] = ptotal1                # just 16 bit?, is info in 2/uknown7 ?
+                dd['2/totalpower'] = ptotal2                
+                dd['1/todayspower'] = pday1
+                dd['2/todayspower'] = pday2                
 
-        elif cmd==132:  # 0x84
-            d['name'] = 'unknown0x84'
-            uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack(
-                '>HHHHHHHH', p[10:26])
-            d['uk1'] = uk1
-            d['uk2'] = uk2
-            d['uk3'] = uk3
-            d['uk4'] = uk4
-            d['uk5'] = uk5
-            d['uk6'] = uk6
-            d['uk7'] = uk7
-            d['uk8'] = uk8
+            elif cmd==3:  # 0x03
+                """
+                On HM600 Response to
+                    0x80 0x03 (garbled data)
+                """
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack(
+                    '>HHHHHHHH', p[10:26])
+                    
+                dd['name'] = 'error3'
+                if debugMode:
+                    print(f'uk1={uk1}, ', end='')
+                    print(f'uk2={uk2}, ', end='')
+                    print(f'uk3={uk3}, ', end='')
+                    print(f'uk4={uk4}, ', end='')
+                    print(f'uk5={uk5}, ', end='')
+                    print(f'uk6={uk6}, ', end='')
+                    print(f'uk7={uk7}, ', end='')
+                    print(f'uk8={uk8}')
 
-        else:
-            print(f'unknown cmd {cmd}')
+                dd['_uk1'] = uk1
+                dd['_uk2'] = uk2
+                dd['_uk3'] = uk3
+                dd['_uk4'] = uk4
+                dd['_uk5'] = uk5
+                dd['_uk6'] = uk6
+                dd['_uk7'] = uk7
+                dd['_uk8'] = uk8
+
+            elif cmd==4:  # 0x04
+                """
+                On HM600 Response to
+                    0x80 0x03 (garbled data)
+                """
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack(
+                    '>HHHHHHHH', p[10:26])
+                    
+                dd['name'] = 'error4'
+                if debugMode:
+                    print(f'uk1={uk1}, ', end='')
+                    print(f'uk2={uk2}, ', end='')
+                    print(f'uk3={uk3}, ', end='')
+                    print(f'uk4={uk4}, ', end='')
+                    print(f'uk5={uk5}, ', end='')
+                    print(f'uk6={uk6}, ', end='')
+                    print(f'uk7={uk7}, ', end='')
+                    print(f'uk8={uk8}')
+
+                dd['_uk1'] = uk1
+                dd['_uk2'] = uk2
+                dd['_uk3'] = uk3
+                dd['_uk4'] = uk4
+                dd['_uk5'] = uk5
+                dd['_uk6'] = uk6
+                dd['_uk7'] = uk7
+                dd['_uk8'] = uk8
+
+            elif cmd==5:  # 0x05
+                """
+                On HM600 Response to
+                    0x80 0x03 (garbled data)
+                """
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack(
+                    '>HHHHHHHH', p[10:26])
+                    
+                dd['name'] = 'error5'
+                if debugMode:
+                    print(f'uk1={uk1}, ', end='')
+                    print(f'uk2={uk2}, ', end='')
+                    print(f'uk3={uk3}, ', end='')
+                    print(f'uk4={uk4}, ', end='')
+                    print(f'uk5={uk5}, ', end='')
+                    print(f'uk6={uk6}, ', end='')
+                    print(f'uk7={uk7}, ', end='')
+                    print(f'uk8={uk8}')
+
+                dd['_uk1'] = uk1
+                dd['_uk2'] = uk2
+                dd['_uk3'] = uk3
+                dd['_uk4'] = uk4
+                dd['_uk5'] = uk5
+                dd['_uk6'] = uk6
+                dd['_uk7'] = uk7
+                dd['_uk8'] = uk8
+
+            elif cmd==6:  # 0x06
+                """
+                On HM600 Response to
+                    0x80 0x03 (garbled data)
+                """
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack(
+                    '>HHHHHHHH', p[10:26])
+                    
+                dd['name'] = 'error7'
+                if debugMode:
+                    print(f'uk1={uk1}, ', end='')
+                    print(f'uk2={uk2}, ', end='')
+                    print(f'uk3={uk3}, ', end='')
+                    print(f'uk4={uk4}, ', end='')
+                    print(f'uk5={uk5}, ', end='')
+                    print(f'uk6={uk6}, ', end='')
+                    print(f'uk7={uk7}, ', end='')
+                    print(f'uk8={uk8}')
+
+                dd['_uk1'] = uk1
+                dd['_uk2'] = uk2
+                dd['_uk3'] = uk3
+                dd['_uk4'] = uk4
+                dd['_uk5'] = uk5
+                dd['_uk6'] = uk6
+                dd['_uk7'] = uk7
+                dd['_uk8'] = uk8
+
+            elif cmd==7:  # 0x07
+                """
+                On HM600 Response to
+                    0x80 0x03 (garbled data)
+                """
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack(
+                    '>HHHHHHHH', p[10:26])
+                    
+                dd['name'] = 'error8'
+                if debugMode:
+                    print(f'uk1={uk1}, ', end='')
+                    print(f'uk2={uk2}, ', end='')
+                    print(f'uk3={uk3}, ', end='')
+                    print(f'uk4={uk4}, ', end='')
+                    print(f'uk5={uk5}, ', end='')
+                    print(f'uk6={uk6}, ', end='')
+                    print(f'uk7={uk7}, ', end='')
+                    print(f'uk8={uk8}')
+
+                dd['_uk1'] = uk1
+                dd['_uk2'] = uk2
+                dd['_uk3'] = uk3
+                dd['_uk4'] = uk4
+                dd['_uk5'] = uk5
+                dd['_uk6'] = uk6
+                dd['_uk7'] = uk7
+                dd['_uk8'] = uk8
+
+            elif cmd==129:
+                dd['name'] = 'error129'
+
+            elif cmd==131:  # 0x83
+                dd['name'] = 'emeter'
+                uk1, i, uk3, t, uk5, uk6 = struct.unpack('>HHHHHH', p[10:22])
+                dd['0/currentAC'] = i/100
+                dd['0/temperature'] = t/10
+                dd['_uk1'] = uk1
+                dd['_uk3'] = uk3
+                dd['_uk5'] = uk5
+                dd['_uk6'] = uk6
+
+            elif cmd==132:  # 0x84
+                dd['name'] = 'uk0x84'
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack(
+                    '>HHHHHHHH', p[10:26])
+                
+                dd['name'] = 'error132'
+                if debugMode:
+                    print(f'uk1={uk1}, ', end='')
+                    print(f'uk2={uk2}, ', end='')
+                    print(f'uk3={uk3}, ', end='')
+                    print(f'uk4={uk4}, ', end='')
+                    print(f'uk5={uk5}, ', end='')
+                    print(f'uk6={uk6}, ', end='')
+                    print(f'uk7={uk7}, ', end='')
+                    print(f'uk8={uk8}')            
+                    
+                dd['_uk1'] = uk1
+                dd['_uk2'] = uk2
+                dd['_uk3'] = uk3
+                dd['_uk4'] = uk4
+                dd['_uk5'] = uk5
+                dd['_uk6'] = uk6
+                dd['_uk7'] = uk7
+                dd['_uk9'] = uk8
+
+            else:
+                print(f'unknown cmd {cmd}')
+                        
+                
+        elif invType=="HM-300":
+            d["infos"]=[dd]
+            if cmd==1:                
+                uk0, u1, i1, p1, ptotal, pday, u  = struct.unpack(
+                    '>HHHHLHH', p[10:26])
+                dd['name'] = 'emeter-dc'    
+                dd['1/voltage'] = u1/10
+                dd['1/current'] = i1/100
+                dd['1/power'] = p1/10
+                dd['1/totalpower'] = ptotal
+                dd['1/todayspower'] = pday
+                
+                dd={}
+                d["infos"].append(dd)
+                dd['name'] = 'emeter'    
+                dd['0/voltageAC'] = u/10             
+            
+            elif cmd==130:  # 0x82
+                freq, p, uk0, i, uk1, t,  uk2, uk3  = struct.unpack(
+                    '>HHHHHHHH', p[10:26])
+                dd['name'] = 'emeter'    
+                dd['0/frequency'] = freq/100
+                dd['0/powerAC'] = p/10
+                dd['0/currentAC'] = i/100
+                dd['0/temperature'] = t/10
+                       
+            else:
+                print(f'unknown cmd {cmd}')
+                        
+            
+            
     else:
         print(f'unknown frame id {p[0]}')
 
     # output to stdout
-    if d:
+    if debugMode and d:
         print(json.dumps(d))
 
     # output to MQTT
-    if d:
-        j = json.dumps(d)
-        mqtt_client.publish(f"ahoy/{d['src']}/{d['name']}", j)
-        if d['cmd']==2:
-            mqtt_client.publish(f'ahoy/{d["src"]}/emeter/0/voltage', d['u_V'])
-            mqtt_client.publish(f'ahoy/{d["src"]}/emeter/0/power', d['p_W'])
-            mqtt_client.publish(f'ahoy/{d["src"]}/emeter/0/total', d['wtot1_Wh'])
-            mqtt_client.publish(f'ahoy/{d["src"]}/frequency', d['f_Hz'])
-        if d['cmd']==1:
-            mqtt_client.publish(f'ahoy/{d["src"]}/emeter-dc/0/power', d['p1_W'])
-            mqtt_client.publish(f'ahoy/{d["src"]}/emeter-dc/0/voltage', d['u1_V'])
-            mqtt_client.publish(f'ahoy/{d["src"]}/emeter-dc/0/current', d['i1_A'])
-            mqtt_client.publish(f'ahoy/{d["src"]}/emeter-dc/1/power', d['p2_W'])
-            mqtt_client.publish(f'ahoy/{d["src"]}/emeter-dc/1/voltage', d['u2_V'])
-            mqtt_client.publish(f'ahoy/{d["src"]}/emeter-dc/1/current', d['i2_A'])
-        if d['cmd']==131:
-            mqtt_client.publish(f'ahoy/{d["src"]}/temperature', d['t_C'])
-
+    if d and d['crc8_valid'] and mqttMode:
+        j = json.dumps(d)        
+        for info in d["infos"]:            
+            if "name" in info:
+                if "emeter" in info["name"]:
+                    mqtt_client.publish(f"ahoy/{d['fullsrc']}/{info['name']}", "")
+                    for key in sorted(info.keys()):
+                        if key!="name" and not key.startswith("_"):
+                            if debugMode:
+                                print("publishing",f'ahoy/{d["fullsrc"]}/{info["name"]}/{key}', info[key])
+                            mqtt_client.publish(f'ahoy/{d["fullsrc"]}/{info["name"]}/{key}', info[key])
 
 
 def main_loop():
@@ -233,8 +551,30 @@ def main_loop():
     """
 
     global t_last_tx
+    global m_last_tx
+    global mType
+    global mFullSer
+    global mChannels
 
-    print_addr(inv_ser)
+    m_last_tx={}
+    mType={}
+    mFullSer={}
+    mChannels={}
+
+    global _hm1200_i4
+    _hm1200_i4=0
+    global _hm1200_p4
+    _hm1200_p4=0
+
+    minRefreshSeconds=10.0
+    mLastInv={}
+    for inv_ser in l_inv_ser:
+        (type,radioKey,nrChannels)=ser_to_type(inv_ser)
+        mType[radioKey]=type
+        mFullSer[radioKey]=inv_ser
+        mChannels[radioKey]=nrChannels
+        print_addr(inv_ser)
+        mLastInv[inv_ser]=time.monotonic_ns()-1e9*minRefreshSeconds*2
     print_addr(dtu_ser)
 
     ctr = 1
@@ -244,85 +584,122 @@ def main_loop():
     
     rx_channels = [3,23,61,75]
     rx_channel_id = 0
-    rx_channel = rx_channels[rx_channel_id]
+    rx_channel = rx_channels[rx_channel_id]    
+    rx_channel_ack = None
+    rx_error = 0
 
     tx_channels = [40]
     tx_channel_id = 0
     tx_channel = tx_channels[tx_channel_id]
+    
+    secsBetweenInverters=max(3,(15.0/len(l_inv_ser)))
+    
+    radio.setChannel(rx_channel)
+    radio.enableDynamicPayloads()
+    radio.setAutoAck(True)
+    radio.setRetries(15, 2)
+    radio.setPALevel(RF24_PA_LOW)
+    #radio.setPALevel(RF24_PA_MAX)
+    radio.setDataRate(RF24_250KBPS)
+    radio.openReadingPipe(1,ser_to_esb_addr(dtu_ser))
 
+    iInv=-1
     while True:
-        # Sweep receive start channel
-        rx_channel_id = ctr % len(rx_channels)
-        rx_channel = rx_channels[rx_channel_id]
-
-        radio.setChannel(rx_channel)
-        radio.enableDynamicPayloads()
-        radio.setAutoAck(False)
-        radio.setPALevel(RF24_PA_MAX)
-        radio.setDataRate(RF24_250KBPS)
-        radio.openWritingPipe(ser_to_esb_addr(inv_ser))
+        iInv=iInv+1
+        iInvCheck=iInv % len(l_inv_ser)
+        inv_ser=l_inv_ser[iInv % len(l_inv_ser)]
+        nowNs=time.monotonic_ns()
+        maxAge=0     
+        while mLastInv[inv_ser]>nowNs-1e9*minRefreshSeconds:
+            maxAge=max(maxAge,nowNs-mLastInv[inv_ser])
+            iInv=iInv+1
+            inv_ser=l_inv_ser[iInv % len(l_inv_ser)]
+            if iInv % len(l_inv_ser)==iInvCheck:
+                toWait=(1e9*minRefreshSeconds-maxAge)/1e9
+                #print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),"waiting with radio silence",toWait)
+                time.sleep(toWait)                
+                break
+        mLastInv[inv_ser]=time.monotonic_ns()
+        
         radio.flush_rx()
         radio.flush_tx()
-        radio.openReadingPipe(1,ser_to_esb_addr(dtu_ser))
-        radio.startListening()
+        m_buf = []
+        # Sweep receive start channel
+        if not rx_channel_ack:
+            rx_channel_id = ctr % len(rx_channels)
+            rx_channel = rx_channels[rx_channel_id]
 
         tx_channel_id = tx_channel_id + 1
         if tx_channel_id >= len(tx_channels):
             tx_channel_id = 0
         tx_channel = tx_channels[tx_channel_id]
 
-        #
-        # TX
-        #
+        # Transmit
+        ts = int(time.time())
+        payload = compose_0x80_msg(src_ser_no=dtu_ser, dst_ser_no=inv_ser, ts=ts, subtype=b'\x0b')
+        dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
         radio.stopListening()  # put radio in TX mode
         radio.setChannel(tx_channel)
         radio.openWritingPipe(ser_to_esb_addr(inv_ser))
+        t_tx_start = time.monotonic_ns()
+        tx_status = radio.write(payload)  # will always yield 'True' because auto-ack is disabled
+        t_last_tx = t_tx_end = time.monotonic_ns()
+        m_last_tx[inv_ser[4:]]=t_last_tx
+        radio.setChannel(rx_channel)
+        radio.startListening()
 
-        ts = int(time.time())
-        payload = compose_0x80_msg(src_ser_no=dtu_ser, dst_ser_no=inv_ser, ts=ts)
-        dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-        last_tx_message = f"{dt} Transmit {ctr:5d}: channel={tx_channel} len={len(payload)} | " + \
-            " ".join([f"{b:02x}" for b in payload]) + f" rx_ch: {rx_channel}"
-        print(last_tx_message)
-
-        # for i in range(0,3):
-        result = radio.write(payload)  # will always yield 'True' because auto-ack is disabled
-        #    time.sleep(.05)
-
-        t_last_tx = time.monotonic_ns()
+        last_tx_message = f"{dt} Transmit {ctr:5d}: channel={tx_channel} len={len(payload)} ack={tx_status} | " + \
+            " ".join([f"{b:02x}" for b in payload]) + f" to: {inv_ser}" + "\n"
         ctr = ctr + 1
 
-        t_end = time.monotonic_ns()+5e9
-        tslots = [1000]  #, 40, 50, 60, 70]  # switch channel at these ms times since transmission
+        # Receive loop
+        t_end = time.monotonic_ns()+1e9
+        while time.monotonic_ns() < t_end:
+            has_payload, pipe_number = radio.available_pipe()
+            if has_payload:
+                # Data in nRF24 buffer, read it
+                rx_error = 0
+                rx_channel_ack = rx_channel
+                t_end = time.monotonic_ns()+6e7
+                
+                size = radio.getDynamicPayloadSize()
+                payload = radio.read(size)
+                m_buf.append( {
+                    'p': payload,
+                    'ch_rx': rx_channel, 'ch_tx': tx_channel,
+                    'time_rx': datetime.now(), 'latency': time.monotonic_ns()-t_last_tx} )
 
-        for tslot in tslots:
-            t_end = t_last_tx + tslot*1e6  # ms to ns
+                # Only print last transmittet message if we got any response
+                print(last_tx_message, end='')
+                last_tx_message = ''
+            else:
+                # No data in nRF rx buffer, search and wait
+                # Channel lock in (not currently used)
+                rx_error = rx_error + 1
+                if rx_error > 0:
+                    rx_channel_ack = None
+                # Channel hopping
+                if not rx_channel_ack:
+                    rx_channel_id = rx_channel_id + 1
+                    if rx_channel_id >= len(rx_channels):
+                        rx_channel_id = 0
+                    rx_channel = rx_channels[rx_channel_id]
+                    radio.stopListening()
+                    radio.setChannel(rx_channel)
+                    radio.startListening()
+                time.sleep(0.005)
 
-            radio.stopListening()
-            radio.setChannel(rx_channel)
-            radio.startListening()
-            while time.monotonic_ns() < t_end:
-                has_payload, pipe_number = radio.available_pipe()
-                if has_payload:
-                    size = radio.getDynamicPayloadSize()
-                    payload = radio.read(size)
-                    # print(last_tx_message, end='')
-                    last_tx_message = ''
-                    dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-                    print(f"{dt} Received {size} bytes on channel {rx_channel} pipe {pipe_number}: " +
-                          " ".join([f"{b:02x}" for b in payload]))
-                    on_receive(payload, ch_rx=rx_channel, ch_tx=tx_channel)
-                else:
-                    pass
-                    # time.sleep(0.001)
+        # Process receive buffer outside time critical receive loop
+        for param in m_buf:
+            on_receive(**param)
 
-            rx_channel_id = rx_channel_id + 1
-            if rx_channel_id >= len(rx_channels):
-                rx_channel_id = 0
-            rx_channel = rx_channels[rx_channel_id]
+        if len(m_buf)==0:
+            mLastInv[inv_ser]=time.monotonic_ns()-1e9*minRefreshSeconds/2.0
 
+        # Flush console
         print(flush=True, end='')
-        # time.sleep(2)
+
 
 
 
@@ -343,3 +720,4 @@ if __name__ == "__main__":
         print(" Keyboard Interrupt detected. Exiting...")
         radio.powerDown()
         sys.exit()
+
