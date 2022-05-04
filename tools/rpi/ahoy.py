@@ -227,7 +227,7 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
                     dd['4/voltage'] = _hm1200_p4/_hm1200_i4
                     
                 dd['3/power'] = p3/10   
-                dd['3/voltage'] = p3/i3  # hack where is it
+                dd['3/voltage'] = (p3/10)/(i3/100)  # hack where is it
  
                 dd['2/totalpower'] = ptotal2
                 dd['1/todayspower'] = pday1
