@@ -37,10 +37,11 @@ mqtt_user = cfg.get('mqtt', 'user', fallback='')
 mqtt_password = cfg.get('mqtt', 'password', fallback='')
 
 radio = RF24(22, 0, 1000000)
-mqtt_client = paho.mqtt.client.Client()
-mqtt_client.username_pw_set(mqtt_user, mqtt_password)
-mqtt_client.connect(mqtt_host, mqtt_port)
-mqtt_client.loop_start()
+if mqttMode:
+    mqtt_client = paho.mqtt.client.Client()
+    mqtt_client.username_pw_set(mqtt_user, mqtt_password)
+    mqtt_client.connect(mqtt_host, mqtt_port)
+    mqtt_client.loop_start()
 
 # Master Address ('DTU')
 dtu_ser = cfg.get('dtu', 'serial', fallback='99978563412')  # identical to fc22's
@@ -101,8 +102,7 @@ def ser_to_esb_addr(s):
     air_order = ser_to_hm_addr(s)[::-1] + b'\x01'
     return air_order[::-1]
 
-
-def compose_0x80_msg(dst_ser_no=72220200, src_ser_no=72220200, ts=None, subtype=b'\x0b'):
+def compose_0x80_msg(dst_ser_no=72220200, src_ser_no=72220200, ts=None, messageType=b'\x80', subtype=b'\x0b', refetch=None):
     """
     Create a valid 0x80 request with the given parameters, and containing the 
     current system time.
@@ -116,7 +116,13 @@ def compose_0x80_msg(dst_ser_no=72220200, src_ser_no=72220200, ts=None, subtype=
     p = p + b'\x15'
     p = p + ser_to_hm_addr(dst_ser_no)
     p = p + ser_to_hm_addr(src_ser_no)
-    p = p + b'\x80'
+    if refetch is not None:
+        p=p+refetch        
+        crc8 = f_crc8(p)
+        p = p + struct.pack('B', crc8)   
+        return p
+    
+    p = p + messageType
 
     # encapsulated payload
     pp = subtype + b'\x00'
@@ -163,12 +169,18 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
     d['trans_id'] = ctr
 
     dt = time_rx.strftime("%Y-%m-%d %H:%M:%S.%f")
-    print(f"{dt} Received {size} bytes on channel {ch_rx} after tx {latency}ns: " +
+    print(f"{dt} Received {size} b  {ch_tx:2d} to channel {ch_rx:2d} after tx {latency:10d} ns: " +
         " ".join([f"{b:02x}" for b in p]))
-
     # check crc8
     crc8 = f_crc8(p[:-1])
     d['crc8_valid'] = True if crc8==p[-1] else False
+    
+    if debugMode:
+        ws='H'*int((size-1-10)/2)
+        pw=struct.unpack('>B'+ws, p[9:size-1])
+        print(f"{dt} Recwords {size} b  {ch_tx:2d} to channel {ch_rx:2d} after tx {latency:10d} ns: " + "      "+f"crc: {int(crc8==p[-1])}            "+
+            " ".join([f"{b:05d}" for b in pw]))
+    
 
     # interpret content
     mid = p[0]
@@ -191,6 +203,7 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
             print(f'MSG src={d["src"]}, dst={d["dst"]}, cmd={d["cmd"]}:')
 
         if inv_id not in mType:
+            print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),"UNKWOWN source",inv_id)
             return
         invType=mType[inv_id]
         d['fullsrc']=mFullSer[inv_id]
@@ -201,7 +214,7 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
             if cmd==1:
                 dd['name'] = 'emeter-dc'  # guess voltages are dc like with hm-600 and total power is long 
                 uk1, u1, i1, i2, p1, p2, ptotal1, uk8 = struct.unpack('>HHHHHHLH', p[10:28])
-                    
+                   
                 dd['1/voltage'] = u1/10
                 dd['1/current'] = i1/100
                 dd['2/current'] = i2/10
@@ -494,9 +507,8 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
                 
         elif invType=="HM-300":
             d["infos"]=[dd]
-            if cmd==1:                
-                uk0, u1, i1, p1, ptotal, pday, u  = struct.unpack(
-                    '>HHHHLHH', p[10:26])
+            if cmd==1:                  
+                uk0, u1, i1, p1, ptotal, pday, u  = struct.unpack('>HHHHLHH', p[10:26])
                 dd['name'] = 'emeter-dc'    
                 dd['1/voltage'] = u1/10
                 dd['1/current'] = i1/100
@@ -509,9 +521,93 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
                 dd['name'] = 'emeter'    
                 dd['0/voltageAC'] = u/10             
             
+            elif cmd==2:  # 0x02
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack('>HHHHHHHH', p[10:26])
+                                    
+                dd['_uk1'] = uk1          
+                dd['_uk2'] = uk2    
+                dd['_uk3'] = uk3    
+                dd['_uk4'] = uk4    
+                dd['_uk5'] = uk5    
+                dd['_uk6'] = uk6    
+                dd['_uk7'] = uk7    
+                dd['_uk9'] = uk8    
+            
+            elif cmd==3:  # 0x03
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack('>HHHHHHHH', p[10:26])
+                                    
+                dd['_uk1'] = uk1          
+                dd['_uk2'] = uk2    
+                dd['_uk3'] = uk3    
+                dd['_uk4'] = uk4    
+                dd['_uk5'] = uk5    
+                dd['_uk6'] = uk6    
+                dd['_uk7'] = uk7    
+                dd['_uk9'] = uk8 
+            
+            elif cmd==4:  # 0x04
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack('>HHHHHHHH', p[10:26])
+                                    
+                dd['_uk1'] = uk1          
+                dd['_uk2'] = uk2    
+                dd['_uk3'] = uk3    
+                dd['_uk4'] = uk4    
+                dd['_uk5'] = uk5    
+                dd['_uk6'] = uk6    
+                dd['_uk7'] = uk7    
+                dd['_uk9'] = uk8 
+            
+            elif cmd==5:  # 0x05
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack('>HHHHHHHH', p[10:26])
+                                    
+                dd['_uk1'] = uk1          
+                dd['_uk2'] = uk2    
+                dd['_uk3'] = uk3    
+                dd['_uk4'] = uk4    
+                dd['_uk5'] = uk5    
+                dd['_uk6'] = uk6    
+                dd['_uk7'] = uk7    
+                dd['_uk9'] = uk8 
+            
+            elif cmd==6:  # 0x06
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack('>HHHHHHHH', p[10:26])
+                                    
+                dd['_uk1'] = uk1          
+                dd['_uk2'] = uk2    
+                dd['_uk3'] = uk3    
+                dd['_uk4'] = uk4    
+                dd['_uk5'] = uk5    
+                dd['_uk6'] = uk6    
+                dd['_uk7'] = uk7    
+                dd['_uk9'] = uk8 
+            
+            elif cmd==7:  # 0x07
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack('>HHHHHHHH', p[10:26])
+                                    
+                dd['_uk1'] = uk1          
+                dd['_uk2'] = uk2    
+                dd['_uk3'] = uk3    
+                dd['_uk4'] = uk4    
+                dd['_uk5'] = uk5    
+                dd['_uk6'] = uk6    
+                dd['_uk7'] = uk7    
+                dd['_uk9'] = uk8 
+            
+            elif cmd==129:  # 0x81
+                uk1, uk2, uk3, uk4, uk5, uk6, uk7, uk8 = struct.unpack('>HHHHHHHH', p[10:26])
+                    
+                dd['_uk1'] = uk1          
+                dd['_uk2'] = uk2    
+                dd['_uk3'] = uk3    
+                dd['_uk4'] = uk4    
+                dd['_uk5'] = uk5    
+                dd['_uk6'] = uk6    
+                dd['_uk7'] = uk7    
+                dd['_uk9'] = uk8    
+            
             elif cmd==130:  # 0x82
-                freq, p, uk0, i, uk1, t,  uk2, uk3  = struct.unpack(
-                    '>HHHHHHHH', p[10:26])
+                freq, p, uk0, i, uk1, t,  uk2, uk3  = struct.unpack('>HHHHHHHH', p[10:26])
+                                   
                 dd['name'] = 'emeter'    
                 dd['0/frequency'] = freq/100
                 dd['0/powerAC'] = p/10
@@ -582,13 +678,15 @@ def main_loop():
 
     ts = int(time.time())  # see what happens if we always send one and the same (constant) time!
     
-    rx_channels = [3,23,61,75]
+    rx_channels = [3,23,61,75,83]
+    #rx_channels = [3,75]  # in case of tx channel 40 this leads to basically no packet loss for me
     rx_channel_id = 0
     rx_channel = rx_channels[rx_channel_id]    
     rx_channel_ack = None
     rx_error = 0
 
     tx_channels = [40]
+    #tx_channels = [3,23,61,75,40]
     tx_channel_id = 0
     tx_channel = tx_channels[tx_channel_id]
     
@@ -609,7 +707,7 @@ def main_loop():
         iInvCheck=iInv % len(l_inv_ser)
         inv_ser=l_inv_ser[iInv % len(l_inv_ser)]
         nowNs=time.monotonic_ns()
-        maxAge=0     
+        maxAge=0  
         while mLastInv[inv_ser]>nowNs-1e9*minRefreshSeconds:
             maxAge=max(maxAge,nowNs-mLastInv[inv_ser])
             iInv=iInv+1
@@ -636,7 +734,7 @@ def main_loop():
 
         # Transmit
         ts = int(time.time())
-        payload = compose_0x80_msg(src_ser_no=dtu_ser, dst_ser_no=inv_ser, ts=ts, subtype=b'\x0b')
+        payload = compose_0x80_msg(src_ser_no=dtu_ser, dst_ser_no=inv_ser, ts=ts)
         dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
 
         radio.stopListening()  # put radio in TX mode
@@ -646,33 +744,70 @@ def main_loop():
         tx_status = radio.write(payload)  # will always yield 'True' because auto-ack is disabled
         t_last_tx = t_tx_end = time.monotonic_ns()
         m_last_tx[inv_ser[4:]]=t_last_tx
+        if debugMode:
+            print (dt,f"Sent:      {ctr:6d}:   channel {tx_channel:2d} to: {inv_ser}")        
         radio.setChannel(rx_channel)
         radio.startListening()
 
-        last_tx_message = f"{dt} Transmit {ctr:5d}: channel={tx_channel} len={len(payload)} ack={tx_status} | " + \
+        last_tx_message = f"{dt} Transmit {ctr:8d}:   channel {tx_channel:2d} len={len(payload):3d} ack={str(tx_status):7s}   | " + \
             " ".join([f"{b:02x}" for b in payload]) + f" to: {inv_ser}" + "\n"
         ctr = ctr + 1
 
         # Receive loop
-        t_end = time.monotonic_ns()+1e9
+        t_end = time.monotonic_ns()+1e9*1
+        receivedPackets=[]
+        receiveTries=0
+        fakeMissing1=True
         while time.monotonic_ns() < t_end:
+            if len(receivedPackets)>0 and receivedPackets[-1]>0x81 and receiveTries==0:
+                for ii in range(1,receivedPackets[-1]-0x80):
+                    if receivedPackets[ii-1]!=ii:
+                        payload = compose_0x80_msg(src_ser_no=dtu_ser, dst_ser_no=inv_ser, refetch=struct.pack('B', ii+0x80) )
+                        print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),"missing",ii, "sending ",len(payload),"byes on",tx_channel,"is"," ".join([f"{b:02x}" for b in payload]))
+                        radio.stopListening()  # put radio in TX mode
+                        radio.setChannel(tx_channel)
+                        radio.openWritingPipe(ser_to_esb_addr(inv_ser))
+                        tx_status = radio.write(payload)
+                        radio.setChannel(rx_channel)
+                        radio.startListening()
+                        receiveTries=10
+                        break                    
+            receiveTries=max(0,receiveTries-1)
+            
+            if len(receivedPackets)>1 and len(receivedPackets)==receivedPackets[-1]-0x80:
+                print("all packets received:",len(receivedPackets))
+                break
+            
             has_payload, pipe_number = radio.available_pipe()
             if has_payload:
                 # Data in nRF24 buffer, read it
                 rx_error = 0
-                rx_channel_ack = rx_channel
-                t_end = time.monotonic_ns()+6e7
+                rx_channel_ack = rx_channel                
+                #t_end = time.monotonic_ns()+6e7
                 
                 size = radio.getDynamicPayloadSize()
                 payload = radio.read(size)
+                
+                #if size>10 and payload[0]==0x95 and payload[9]==1 and fakeMissing1:
+                #    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),"faking receive error")
+                #    fakeMissing1=False
+                #    continue
+                
                 m_buf.append( {
                     'p': payload,
                     'ch_rx': rx_channel, 'ch_tx': tx_channel,
                     'time_rx': datetime.now(), 'latency': time.monotonic_ns()-t_last_tx} )
-
+                    
                 # Only print last transmittet message if we got any response
                 print(last_tx_message, end='')
                 last_tx_message = ''
+                
+                if size>10 and payload[0]==0x95:
+                    receivedPackets.append(payload[9])
+                    receivedPackets=sorted(receivedPackets)
+                    #print ("got: ",payload[9],"is:"," ".join([f"{b:02x}" for b in payload]))
+                    #print (receivedPackets)
+                
             else:
                 # No data in nRF rx buffer, search and wait
                 # Channel lock in (not currently used)
@@ -684,6 +819,9 @@ def main_loop():
                     rx_channel_id = rx_channel_id + 1
                     if rx_channel_id >= len(rx_channels):
                         rx_channel_id = 0
+                    #import random
+                    #random.shuffle(rx_channels)
+                    #random.shuffle(tx_channels)
                     rx_channel = rx_channels[rx_channel_id]
                     radio.stopListening()
                     radio.setChannel(rx_channel)
