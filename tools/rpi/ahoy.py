@@ -18,6 +18,9 @@ parser = argparse.ArgumentParser(description='monitor homiles')
 parser.add_argument('-c', dest='configName', action='store', default='ahoy.conf',help='config file with settings')
 parser.add_argument('-m', dest='mqttMode', action='store', default='1',help='mqtt mode, default 1')
 parser.add_argument('-d', dest='debugMode', action='store', default='0',help='debug output, default 0')
+parser.add_argument('-i', dest='pollingInterval', action='store', default='10',help='per inverter polling inverval, default 60')
+parser.add_argument('-f', dest='file', action='store', default='',help='file output, default none')
+parser.add_argument('-e', dest='endtime', action='store', default='',help='endtime in HH24:MI, default none')
 args = vars(parser.parse_args())
 
 mqttMode=int(args['mqttMode'])>0
@@ -25,6 +28,9 @@ print("mqttMode",mqttMode)
 
 debugMode=int(args['debugMode'])>0
 print("debugMode",debugMode)
+
+minRefreshSeconds=int(args['pollingInterval'])
+print("inverter polling interval in seconds:",minRefreshSeconds)
 
 configName=args['configName']
 print("using config from",configName)
@@ -35,6 +41,18 @@ mqtt_host = cfg.get('mqtt', 'host', fallback='192.168.1.1')
 mqtt_port = cfg.getint('mqtt', 'port', fallback=1883)
 mqtt_user = cfg.get('mqtt', 'user', fallback='')
 mqtt_password = cfg.get('mqtt', 'password', fallback='')
+
+fileName=args['file']
+outFile=None
+if fileName!="":
+    print("using output file:",fileName)
+    outFile=open(fileName,"a")
+
+endTime=args['endtime']
+if endTime=="":
+    endTime="ZZ:ZZ"
+else:
+    print("will terminate at:",endTime)
 
 radio = RF24(22, 0, 1000000)
 if mqttMode:
@@ -220,10 +238,11 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
                 dd['2/current'] = i2/10
                 dd['1/power'] = p1/10
                 dd['2/power'] = p2/10
-                dd['1/totalpower'] = ptotal1
+                dd['1/totalenergy'] = ptotal1
                 
                 dd['_uk1'] = uk1
                 dd['_uk8'] = uk8
+                _hm1200_ptotal2hb=uk8*65536
 
             elif cmd==2:
                 dd['name'] = 'emeter-dc'  # guess voltages are dc like with hm-600 
@@ -242,9 +261,9 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
                 dd['3/power'] = p3/10   
                 dd['3/voltage'] = (p3/10)/(i3/100)  # hack where is it
  
-                dd['2/totalpower'] = ptotal2
-                dd['1/todayspower'] = pday1
-                dd['2/todayspower'] = pday2
+                dd['2/totalenergy'] = ptotal2+_hm1200_ptotal2hb
+                dd['1/todaysenergy'] = pday1
+                dd['2/todaysenergy'] = pday2
                                 
                 dd['_uk8'] = uk8
         
@@ -260,10 +279,10 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
                 elif _hm1200_i4!=0:
                     dd['4/voltage'] = _hm1200_p4/_hm1200_i4
                                 
-                dd['3/totalpower'] = ptotal3
-                dd['4/totalpower'] = ptotal4
-                dd['4/todayspower'] = pday3
-                dd['4/todayspower'] = pday4
+                dd['3/totalenergy'] = ptotal3
+                dd['4/totalenergy'] = ptotal4
+                dd['4/todaysenergy'] = pday3
+                dd['4/todaysenergy'] = pday4
                 
                 dd={}
                 d["infos"].append(dd)
@@ -305,6 +324,8 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
                 dd['0/powerAC'] = p
                 dd['_uk1'] = uk1
                 dd['_uk8'] = uk8
+                
+                _hm600_ptotal1hb=uk8*65536
 
             elif cmd==2:
                 dd['name'] = 'emeter'
@@ -318,10 +339,10 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
                 dd={}
                 d["infos"].append(dd)
                 dd['name'] = 'emeter-dc'  
-                dd['1/totalpower'] = ptotal1                # just 16 bit?, is info in 2/uknown7 ?
-                dd['2/totalpower'] = ptotal2                
-                dd['1/todayspower'] = pday1
-                dd['2/todayspower'] = pday2                
+                dd['1/totalenergy'] = ptotal1+_hm600_ptotal1hb                # just 16 bit?, is info in 2/uknown8 ?
+                dd['2/totalenergy'] = ptotal2                
+                dd['1/todaysenergy'] = pday1
+                dd['2/todaysenergy'] = pday2                
 
             elif cmd==3:  # 0x03
                 """
@@ -513,8 +534,8 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
                 dd['1/voltage'] = u1/10
                 dd['1/current'] = i1/100
                 dd['1/power'] = p1/10
-                dd['1/totalpower'] = ptotal
-                dd['1/todayspower'] = pday
+                dd['1/totalenergy'] = ptotal
+                dd['1/todaysenergy'] = pday
                 
                 dd={}
                 d["infos"].append(dd)
@@ -639,6 +660,9 @@ def on_receive(p=None, ctr=None, ch_rx=None, ch_tx=None, time_rx=datetime.now(),
                                 print("publishing",f'ahoy/{d["fullsrc"]}/{info["name"]}/{key}', info[key])
                             mqtt_client.publish(f'ahoy/{d["fullsrc"]}/{info["name"]}/{key}', info[key])
 
+    if outFile is not None and d and d['crc8_valid']:
+        return d
+    
 
 def main_loop():
     """
@@ -650,25 +674,28 @@ def main_loop():
     global m_last_tx
     global mType
     global mFullSer
-    global mChannels
+    global mPackets
 
     m_last_tx={}
     mType={}
     mFullSer={}
-    mChannels={}
+    mPackets={}
 
     global _hm1200_i4
     _hm1200_i4=0
     global _hm1200_p4
     _hm1200_p4=0
+    global _hm1200_ptotal2hb
+    _hm1200_ptotal2hb=0
+    global _hm600_ptotal1hb
+    _hm600_ptotal1hb=0
 
-    minRefreshSeconds=10.0
     mLastInv={}
     for inv_ser in l_inv_ser:
-        (type,radioKey,nrChannels)=ser_to_type(inv_ser)
+        (type,radioKey,nrPakets)=ser_to_type(inv_ser)
         mType[radioKey]=type
         mFullSer[radioKey]=inv_ser
-        mChannels[radioKey]=nrChannels
+        mPackets[radioKey]=nrPakets
         print_addr(inv_ser)
         mLastInv[inv_ser]=time.monotonic_ns()-1e9*minRefreshSeconds*2
     print_addr(dtu_ser)
@@ -715,13 +742,27 @@ def main_loop():
             if iInv % len(l_inv_ser)==iInvCheck:
                 toWait=(1e9*minRefreshSeconds-maxAge)/1e9
                 #print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),"waiting with radio silence",toWait)
-                time.sleep(toWait)                
+                timeLeft=toWait
+                while timeLeft>0:
+                    if timeLeft>30:
+                        #print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),"sleeping 30")
+                        time.sleep(30)                
+                        timeLeft-=30
+                    else:
+                        #print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),"sleeping",timeLeft)
+                        time.sleep(timeLeft)
+                        timeLeft=0
+                    HHMM=datetime.now().strftime("%H:%M")
+                    if HHMM==endTime:
+                        print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),"shutting down")
+                        radio.powerDown()
+                        sys.exit()
                 break
         mLastInv[inv_ser]=time.monotonic_ns()
         
         radio.flush_rx()
         radio.flush_tx()
-        m_buf = []
+        m_buf = {}
         # Sweep receive start channel
         if not rx_channel_ack:
             rx_channel_id = ctr % len(rx_channels)
@@ -745,7 +786,7 @@ def main_loop():
         t_last_tx = t_tx_end = time.monotonic_ns()
         m_last_tx[inv_ser[4:]]=t_last_tx
         if debugMode:
-            print (dt,f"Sent:      {ctr:6d}:   channel {tx_channel:2d} to: {inv_ser}")        
+            print (dt,f"Sent:      {ctr:6d}:   channel {tx_channel:2d} to: {inv_ser}")
         radio.setChannel(rx_channel)
         radio.startListening()
 
@@ -758,6 +799,8 @@ def main_loop():
         receivedPackets=[]
         receiveTries=0
         fakeMissing1=True
+        receivingChannels=[]
+        receivingOrder=[]
         while time.monotonic_ns() < t_end:
             if len(receivedPackets)>0 and receivedPackets[-1]>0x81 and receiveTries==0:
                 for ii in range(1,receivedPackets[-1]-0x80):
@@ -768,6 +811,7 @@ def main_loop():
                         radio.setChannel(tx_channel)
                         radio.openWritingPipe(ser_to_esb_addr(inv_ser))
                         tx_status = radio.write(payload)
+                        m_last_tx[inv_ser[4:]]=t_last_tx=time.monotonic_ns()  # later packets could appear earlier..
                         radio.setChannel(rx_channel)
                         radio.startListening()
                         receiveTries=10
@@ -775,7 +819,7 @@ def main_loop():
             receiveTries=max(0,receiveTries-1)
             
             if len(receivedPackets)>1 and len(receivedPackets)==receivedPackets[-1]-0x80:
-                print("all packets received:",len(receivedPackets))
+                print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),"all packets received count",len(receivedPackets))
                 break
             
             has_payload, pipe_number = radio.available_pipe()
@@ -792,19 +836,19 @@ def main_loop():
                 #    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),"faking receive error")
                 #    fakeMissing1=False
                 #    continue
-                
-                m_buf.append( {
-                    'p': payload,
-                    'ch_rx': rx_channel, 'ch_tx': tx_channel,
-                    'time_rx': datetime.now(), 'latency': time.monotonic_ns()-t_last_tx} )
-                    
+               
                 # Only print last transmittet message if we got any response
                 print(last_tx_message, end='')
                 last_tx_message = ''
-                
-                if size>10 and payload[0]==0x95:
-                    receivedPackets.append(payload[9])
-                    receivedPackets=sorted(receivedPackets)
+                if size>=10 and payload[0]==0x95:
+                    cmd=payload[9]
+                    receivingChannels.append(rx_channel)
+                    receivingOrder.append(cmd)
+                    m_buf[cmd]={
+                        'p': payload,
+                        'ch_rx': rx_channel, 'ch_tx': tx_channel,
+                        'time_rx': datetime.now(), 'latency': time.monotonic_ns()-t_last_tx}
+                    receivedPackets=sorted(m_buf.keys())
                     #print ("got: ",payload[9],"is:"," ".join([f"{b:02x}" for b in payload]))
                     #print (receivedPackets)
                 
@@ -829,8 +873,50 @@ def main_loop():
                 time.sleep(0.005)
 
         # Process receive buffer outside time critical receive loop
-        for param in m_buf:
-            on_receive(**param)
+        mFileInfo={}
+        for cmd in sorted(m_buf.keys()):
+            param=m_buf[cmd]
+            d=on_receive(**param)
+            mFileInfo[cmd]=d
+
+        
+        if len(m_buf)==mPackets[inv_ser[4:]]:
+            header = f"{dt} "+inv_ser+f" channel: {tx_channel:2d} rx: "+",".join([f"{b:02d}" for b in receivingChannels])+" order: "+",".join([f"{b:02x}" for b in receivingOrder])
+            lTiming=[]
+            mDC={}
+            mAC={}
+            for cmd in sorted(mFileInfo.keys()):
+                d=mFileInfo[cmd]
+                responseTime=d['response_time_ns']
+                lTiming.append(f"{responseTime:010d}")
+                for info in d["infos"]: 
+                    if "name" in info:
+                        if "emeter" in info["name"]:
+                            if "dc" in info["name"]:
+                                for key in sorted(info.keys()):
+                                    if key!="name" and not key.startswith("_"):
+                                        mDC[key]=info[key]
+                            else:
+                                for key in sorted(info.keys()):
+                                    if key!="name" and not key.startswith("_"):
+                                        newKey=key.replace("0/","")
+                                        mAC[newKey]=info[key]
+                        
+                    
+            header=header+" ts: "+",".join(lTiming)+" "
+            
+            infoAC=""
+            for key in mAC:
+                infoAC=infoAC+key+": "+str(mAC[key])+" "
+            infoDC=""    
+            for key in mDC:
+                infoDC=infoDC+key+": "+str(mDC[key])+" "    
+                
+            message=header+infoAC+infoDC.strip()
+            print(message)
+            if outFile is not None:
+                print(message,file=outFile,flush=True)
+                    
 
         if len(m_buf)==0:
             mLastInv[inv_ser]=time.monotonic_ns()-1e9*minRefreshSeconds/2.0
